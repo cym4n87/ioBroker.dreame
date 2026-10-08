@@ -171,7 +171,7 @@ describe('SF25 adapter integration', () => {
     const sandbox = {
       module: { exports: {} }, __dirname: path.dirname(filename),
       require: (name) => name === '@iobroker/adapter-core'
-        ? { Adapter: class {}, I18n: {} } : realRequire(name),
+        ? { Adapter: class {}, I18n: { getTranslatedObject: (key) => ({ en: key }), translate: (key) => key } } : realRequire(name),
     };
     vm.runInNewContext(fs.readFileSync(filename, 'utf8') + '\nmodule.exports = Dreame;', sandbox, { filename });
     Adapter = sandbox.module.exports;
@@ -212,6 +212,21 @@ describe('SF25 adapter integration', () => {
     assert.equal(c.values[0].value, 42);
     await c._bridgeStatusSummary({ ...device, latestStatus: 999, battery: 80 });
     assert.equal(c.values.length, 1);
+  });
+  it('writes boolean SF25 states with the real state writer without robot specs', async () => {
+    const c = adapter([reply([prop(6, 10, 1), prop(6, 17, 0), prop(6, 26, 1)])]);
+    delete c._lazyCreateState;
+    delete c.specs;
+    c.specMetaDict[device.did] = buildSF25Lookup(device.did).metaMap;
+    c.createdStates = new Set();
+    c.compoundRaw = {};
+    c.setState = (id, value, ack) => c.values.push({ id, value, ack });
+    await c.sf25.updateSF25(device);
+    assert.deepEqual(c.values, [
+      { id: '123.remote.child-lock', value: true, ack: true },
+      { id: '123.remote.silent-mode', value: false, ack: true },
+      { id: '123.status.lid-open', value: true, ack: true },
+    ]);
   });
   it('keeps SF25 out of robot widgets and skips initial map fetching', async () => {
     const c = adapter([{ data: { code: 0, data: { page: { records: [device] } } } }]);
