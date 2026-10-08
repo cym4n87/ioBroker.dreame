@@ -23,6 +23,10 @@ Adapter for Dreame and MOVA robot vacuums and robot mowers.
 
 **Tested with:** L10, L20, X40, A2 1200 (Mower), MOVA 600, MOVA 1000
 
+**Experimental:** Dreame SF25 WiFi food waste disposer (`dreame.fwd.u2527`).
+Status and basic controls are implemented but physical-device validation is still
+pending. See [SF25 notes and validation checklist](docs/SF25.md).
+
 ---
 
 ## Installation
