@@ -505,6 +505,7 @@ class Dreame extends utils.Adapter {
   // im MIoT-Spec des KONKRETEN Geraets (nicht der statischen lib/specs-Tabelle, die fuer
   // alle Staubsauger gleich ist und daher als Praesenz-Check untauglich waere).
   deviceHasMopPadLifting(device) {
+    if (isSF25(device)) return false;
     const specType = device && device.spec_type;
     this._mopPadLiftingCache = this._mopPadLiftingCache || {};
     if (Object.prototype.hasOwnProperty.call(this._mopPadLiftingCache, specType)) {
