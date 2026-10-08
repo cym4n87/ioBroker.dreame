@@ -124,6 +124,52 @@ describe('SF25 protocol and state handling', () => {
     await assert.rejects(c._sf25Write(device, commandFor('program', 0)), /rejected/);
     assert.equal(c.calls.length, 2);
   });
+  it('continues a sleeping write only after wake code 80001 is confirmed by device status', async () => {
+    const c = harness([
+      reply([prop(6, 17, undefined, 1)]), reply([prop(2, 1, 3)]), { data: { code: 80001 } },
+      reply([prop(2, 1, 3)]), reply([prop(2, 1, 2)]),
+      reply([prop(6, 17, undefined)]), reply([prop(6, 17, 1)]),
+    ]);
+    await c._sf25Write(device, commandFor('silent-mode', true));
+    assert.equal(c.calls.filter((r) => r.data.data.method === 'action').length, 1);
+    assert.equal(c.calls.filter((r) => r.data.data.method === 'set_properties').length, 2);
+    assert.equal(c.reachability.at(-1), true);
+  });
+  it('does not retry a sleeping write when wake code 80001 remains unconfirmed', async () => {
+    const c = harness([
+      reply([prop(6, 17, undefined, 1)]), reply([prop(2, 1, 3)]), { data: { code: 80001 } },
+      reply([prop(2, 1, 3)]), reply([prop(2, 1, 3)]), reply([prop(2, 1, 3)]),
+    ]);
+    await assert.rejects(c._sf25Write(device, commandFor('silent-mode', true)), /wake not confirmed/);
+    assert.equal(c.calls.filter((r) => r.data.data.method === 'set_properties').length, 1);
+    assert.equal(c.calls.filter((r) => r.data.data.method === 'action').length, 1);
+  });
+  it('preserves other wake failures instead of treating them as success', async () => {
+    for (const response of [{ data: { code: -8 } }, new Error('timeout')]) {
+      const c = harness([response]);
+      await assert.rejects(c._sf25Wake(device));
+      assert.equal(c.calls.length, 1);
+    }
+  });
+  it('waits for delayed switch readback without resending the accepted write', async () => {
+    const c = harness([
+      reply([prop(6, 17, undefined)]), reply([prop(6, 17, 1)]),
+      reply([prop(6, 17, 1)]), reply([prop(6, 17, 0)]),
+    ]);
+    await c._sf25Write(device, commandFor('silent-mode', false));
+    assert.equal(c.calls.filter((r) => r.data.data.method === 'set_properties').length, 1);
+    assert.equal(c.calls.filter((r) => r.data.data.method === 'get_properties').length, 3);
+    assert.equal(c.values.at(-1).value, 0);
+  });
+  it('requires a valid successful numeric readback even after waiting', async () => {
+    const c = harness([
+      reply([prop(6, 17, undefined)]), reply([prop(6, 17, 1, 1)]),
+      reply([prop(6, 17, '1')]), reply([prop(6, 17, NaN)]),
+    ]);
+    await assert.rejects(c._sf25Write(device, commandFor('silent-mode', true)), /not confirmed/);
+    assert.equal(c.calls.filter((r) => r.data.data.method === 'set_properties').length, 1);
+    assert.equal(c.values.length, 0);
+  });
   it('does not retry other failures or mismatched readback', async () => {
     for (const results of [
       [reply([prop(2, 3, undefined, -1)])],
