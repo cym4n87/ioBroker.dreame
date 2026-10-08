@@ -1,0 +1,232 @@
+'use strict';
+
+const assert = require('node:assert/strict');
+const { describe, it, before } = require('mocha');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const { createRequire } = require('node:module');
+const { SF25Controller } = require('../lib/sf25');
+const { isSF25, buildSF25Lookup, rpcPath, statusTopic, commandFor } = require('../lib/specs/sf25');
+
+const device = { did: '123', model: 'dreame.fwd.u2527', bindDomain: 'app.mt.eu.iot.dreame.tech:19973', masterUid: 'owner' };
+const prop = (siid, piid, value, code = 0) => ({ siid, piid, value, code });
+
+function harness(results = []) {
+  /** @type {any} */
+  const context = new SF25Controller({});
+  context.adapter = context;
+  const lookup = buildSF25Lookup(device.did);
+  Object.assign(context, {
+    specPropsToIdDict: { 123: lookup.propsToId }, specMetaDict: {}, specActionsToIdDict: {},
+    specStatusDict: { 123: lookup.statusList }, namespace: 'dreame.0',
+    brand: { domain: 'eu.iot.dreame.tech:13267' },
+    getHeaders: () => ({}), setTimeout: (callback) => callback(),
+    calls: [], values: [], objects: [], reachability: [], buttons: [], warnings: [],
+    log: { warn: (text) => context.warnings.push(text) },
+    _propertyChanged: () => {},
+    _lazyCreateState: async (did, siid, piid, value) => context.values.push({ did, siid, piid, value }),
+    _updateReachability: async (d, online) => context.reachability.push(online),
+    extendObject: async (id, object) => context.objects.push({ id, object }),
+    setStateAsync: async (...args) => context.buttons.push(args),
+    requestClient: async (request) => {
+      context.calls.push(request);
+      const result = results.shift();
+      if (result instanceof Error) throw result;
+      return result || { data: { code: 0, data: { result: [] } } };
+    },
+  });
+  return context;
+}
+const reply = (result) => ({ data: { code: 0, data: { result } } });
+
+describe('SF25 protocol and state handling', () => {
+  it('recognizes only the known FWD model', () => {
+    assert.equal(isSF25(device), true);
+    for (const model of ['dreame.vacuum.r2320', 'dreame.mower.p2255', 'dreame.fwd.other']) assert.equal(isSF25({ model }), false);
+    assert.equal(isSF25(null), false);
+  });
+  it('keeps tri-state and raw unknown properties separate from vacuum meanings', () => {
+    const lookup = buildSF25Lookup('123');
+    assert.equal(lookup.statusList.length, 14);
+    assert.equal(lookup.propsToId['3-3'], '123.status.temperature');
+    assert.equal(lookup.propsToId['2-10'], '123.status.running-state');
+    assert.equal(lookup.metaMap['2-10'].type, 'number');
+    assert.equal(lookup.metaMap['2-2'].write, false);
+    assert.equal(lookup.metaMap['6-26'].write, false);
+    assert.equal(lookup.propsToId['3-1'], undefined);
+    assert.equal(lookup.statusList.find((p) => p.siid === 3 && p.piid === 3)?.did, '3.3');
+  });
+  it('uses device binding for RPC and owner UID for MQTT', () => {
+    assert.equal(rpcPath(device), '/dreame-iot-com-app/device/sendCommand');
+    assert.equal(rpcPath({}), '/dreame-iot-com/device/sendCommand');
+    assert.equal(statusTopic(device), '/status/123/owner/dreame.fwd.u2527/eu/');
+    assert.throws(() => statusTopic({ ...device, masterUid: null }));
+    assert.throws(() => rpcPath({ bindDomain: 'bad/host' }));
+  });
+  it('rejects unverified programs and coerced switch values before transmission', () => {
+    for (const value of [1, 3, '0', null, false, NaN]) assert.throws(() => commandFor('program', value));
+    for (const value of [1, 'false', null]) assert.throws(() => commandFor('child-lock', value));
+    assert.deepEqual(commandFor('child-lock', true), { siid: 6, piid: 10, value: 1 });
+    assert.deepEqual(commandFor('resume', true), { siid: 2, piid: 10, value: 1 });
+    assert.throws(() => commandFor('open-lid', true));
+  });
+  it('creates commands without inheriting robot actions', async () => {
+    const c = harness();
+    await c.createSF25Remotes(device);
+    assert.equal(c.objects.length, 6);
+    assert(c.objects.some((o) => o.id === '123.remote.pause'));
+    assert(!c.objects.some((o) => /map|mop|battery|start/.test(o.id)));
+  });
+  it('polls explicit successes and discards errors, unknown addresses and invalid values', async () => {
+    const c = harness([reply([prop(3, 3, 42), prop(3, 2, 90, 1), prop(88, 1, 4), prop(4, 3, null), prop(4, 4, 'bad')])]);
+    await c.updateSF25(device);
+    assert.deepEqual(c.values, [{ did: '123', siid: 3, piid: 3, value: 42 }]);
+    assert.equal(c.calls[0].data.data.params.length, 14);
+    assert.equal(c.calls[0].data.did, '123');
+  });
+  it('does not accept a poll result without a property success code', async () => {
+    const c = harness([reply([{ siid: 3, piid: 3, value: 42 }])]);
+    await c.updateSF25(device);
+    assert.equal(c.values.length, 0);
+  });
+  it('accepts MQTT updates without code and resolves property addresses to the device', async () => {
+    const c = harness();
+    await c._sf25ApplyProperties(device, [{ did: '6.26', siid: 6, piid: 26, value: 1 }], true);
+    assert.deepEqual(c.values, [{ did: '123', siid: 6, piid: 26, value: 1 }]);
+  });
+  it('keeps a push arriving during a poll instead of overwriting it with the poll', async () => {
+    const c = harness();
+    const start = Date.now();
+    await c._sf25ApplyProperties(device, [prop(6, 26, 1)], true);
+    await c._sf25ApplyProperties(device, [prop(6, 26, 0)], false, start);
+    assert.equal(c.values.length, 1);
+    assert.equal(c.values[0].value, 1);
+  });
+  it('writes numeric booleans once, checks readback and disables transport retries', async () => {
+    const c = harness([reply([prop(6, 17, undefined)]), reply([prop(6, 17, 1)])]);
+    await c._sf25Write(device, commandFor('silent-mode', true));
+    assert.deepEqual(c.calls[0].data.data.params, [{ did: '6.17', siid: 6, piid: 17, value: 1 }]);
+    assert.equal(c.calls[0]['axios-retry'].retries, 0);
+    assert.equal(c.calls[1].data.data.method, 'get_properties');
+  });
+  it('retries a sleep rejection once after wake and verifies awake status', async () => {
+    const c = harness([
+      reply([prop(6, 17, undefined, 1)]), reply([prop(2, 1, 3)]), reply(undefined),
+      reply([prop(2, 1, 2)]), reply([prop(6, 17, undefined)]), reply([prop(6, 17, 1)]),
+    ]);
+    await c._sf25Write(device, commandFor('silent-mode', true));
+    assert.deepEqual(c.calls.map((r) => r.data.data.method), ['set_properties', 'get_properties', 'action', 'get_properties', 'set_properties', 'get_properties']);
+    assert.deepEqual(c.calls[2].data.data.params, { did: '123', siid: 2, aiid: 1, in: [] });
+  });
+  it('does not wake or retry a rejection while already awake', async () => {
+    const c = harness([reply([prop(2, 3, undefined, 1)]), reply([prop(2, 1, 2)])]);
+    await assert.rejects(c._sf25Write(device, commandFor('program', 0)), /rejected/);
+    assert.equal(c.calls.length, 2);
+  });
+  it('does not retry other failures or mismatched readback', async () => {
+    for (const results of [
+      [reply([prop(2, 3, undefined, -1)])],
+      [reply([])],
+      [new Error('timeout')],
+      [reply([prop(2, 3, undefined)]), reply([prop(2, 3, -1)])],
+    ]) {
+      const c = harness(results);
+      await assert.rejects(c._sf25Write(device, commandFor('program', 0)));
+      assert.equal(c.calls.filter((r) => r.data.data.method === 'set_properties').length, 1);
+    }
+  });
+  it('reports offline and rejects missing or malformed results', async () => {
+    const c = harness([{ data: { code: 80001 } }]);
+    await assert.rejects(c.updateSF25(device), /80001/);
+    assert.deepEqual(c.reachability, [false]);
+    for (const result of [undefined, {}, 'ok']) {
+      await assert.rejects(harness([reply(result)]).updateSF25(device));
+    }
+  });
+  it('ignores acked values and false button resets', async () => {
+    const c = harness();
+    await c.handleSF25State(device, 'dreame.0.123.remote.program', { val: 0, ack: true });
+    await c.handleSF25State(device, 'dreame.0.123.remote.pause', { val: false, ack: false });
+    assert.equal(c.calls.length, 0);
+  });
+  it('prevents concurrent commands and resets buttons after failure', async () => {
+    const c = harness([new Error('timeout')]);
+    c.busy = new Set(['123']);
+    await c.handleSF25State(device, 'dreame.0.123.remote.program', { val: 0, ack: false });
+    assert.equal(c.calls.length, 0);
+    c.busy.clear();
+    await c.handleSF25State(device, 'dreame.0.123.remote.pause', { val: true, ack: false });
+    assert.equal(c.busy.size, 0);
+    assert.deepEqual(c.buttons, [['dreame.0.123.remote.pause', false, true]]);
+  });
+});
+
+describe('SF25 adapter integration', () => {
+  let Adapter;
+  before(() => {
+    // Load the real adapter methods without starting ioBroker or a cloud login.
+    const filename = path.join(__dirname, '../main.js');
+    const realRequire = createRequire(filename);
+    const sandbox = {
+      module: { exports: {} }, __dirname: path.dirname(filename),
+      require: (name) => name === '@iobroker/adapter-core'
+        ? { Adapter: class {}, I18n: {} } : realRequire(name),
+    };
+    vm.runInNewContext(fs.readFileSync(filename, 'utf8') + '\nmodule.exports = Dreame;', sandbox, { filename });
+    Adapter = sandbox.module.exports;
+  });
+  function adapter(results) {
+    const c = harness(results);
+    Object.setPrototypeOf(c, Adapter.prototype);
+    c.sf25 = new SF25Controller(c);
+    c.deviceArray = [device];
+    c.states = {};
+    c.specs = {};
+    c.config = { getMap: true };
+    c.log.info = c.log.debug = c.log.error = () => {};
+    c.json2iob = { parse: () => {} };
+    return c;
+  }
+  it('routes the SF25 independently while retaining existing device types', () => {
+    const c = adapter();
+    assert.equal(c.getDeviceType(device), 'fwd');
+    assert.equal(c.isVacuum(device), false);
+    assert.equal(c.getDeviceType({ model: 'dreame.vacuum.r2320' }), 'vacuum');
+    assert.equal(c.getDeviceType({ model: 'dreame.mower.p2255' }), 'mower');
+    assert.equal(c.getDeviceType({ model: 'dreame.airp.p1' }), 'airp');
+  });
+  it('builds SF25 remotes without requiring an external MIoT spec', async () => {
+    const c = adapter();
+    await c.fetchSpecs();
+    await c.createRemotes();
+    assert.equal(c.calls.length, 0);
+    assert.equal(c.specStatusDict[device.did].length, 14);
+    assert(c.specMetaDict[device.did]['3-3']);
+  });
+  it('uses the SF25 poll even when robot map fetching is enabled', async () => {
+    const c = adapter([reply([prop(3, 3, 42)])]);
+    c.getMap = () => { throw new Error('SF25 must not fetch a robot map'); };
+    await c.updateDevicesViaSpec();
+    assert.equal(c.calls.length, 1);
+    assert.equal(c.values[0].value, 42);
+    await c._bridgeStatusSummary({ ...device, latestStatus: 999, battery: 80 });
+    assert.equal(c.values.length, 1);
+  });
+  it('keeps SF25 out of robot widgets and skips initial map fetching', async () => {
+    const c = adapter([{ data: { code: 0, data: { page: { records: [device] } } } }]);
+    c.getMap = () => { throw new Error('must not fetch map'); };
+    await c.getDeviceList();
+    assert(!c.objects.some((o) => o.id === '123.map'));
+    const list = c.buttons.find((args) => args[0] === 'info.devices');
+    assert.equal(list[1], '[]');
+  });
+  it('dispatches only the SF25 handler for its commands', async () => {
+    const c = adapter();
+    const calls = [];
+    c.sf25.handleSF25State = async (...args) => calls.push(args);
+    await c.onStateChange('dreame.0.123.remote.pause', { ack: false, val: true });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0][0].model, device.model);
+  });
+});
