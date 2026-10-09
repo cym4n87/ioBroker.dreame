@@ -74,7 +74,7 @@ describe('SF25 protocol and state handling', () => {
   it('creates commands without inheriting robot actions', async () => {
     const c = harness();
     await c.createSF25Remotes(device);
-    assert.equal(c.objects.length, 6);
+    assert.equal(c.objects.length, 7);
     assert(c.objects.some((o) => o.id === '123.remote.pause'));
     assert(!c.objects.some((o) => /map|mop|battery|start/.test(o.id)));
   });
@@ -102,6 +102,34 @@ describe('SF25 protocol and state handling', () => {
     await c._sf25ApplyProperties(device, [prop(6, 26, 0)], false, start);
     assert.equal(c.values.length, 1);
     assert.equal(c.values[0].value, 1);
+  });
+  it('shows standby after cycle end despite retained program and running flags', async () => {
+    const c = harness();
+    await c._sf25ApplyProperties(device, [prop(2, 1, 1), prop(2, 3, 0), prop(2, 10, 1)]);
+    assert.deepEqual(c.buttons.at(-1), ['123.status.activity', 1, true]);
+    await c._sf25ApplyProperties(device, [prop(2, 1, 2), prop(2, 3, 1), prop(2, 10, 1)], true);
+    assert.deepEqual(c.buttons.at(-1), ['123.status.activity', 0, true]);
+    assert.deepEqual(c.values.at(-1), { did: '123', siid: 2, piid: 10, value: 1 });
+  });
+  it('derives pause and sleep from separate MQTT updates without changing raw states', async () => {
+    const c = harness();
+    await c._sf25ApplyProperties(device, [prop(2, 1, 1)], true);
+    assert.equal(c.buttons.at(-1)[1], -1);
+    await c._sf25ApplyProperties(device, [prop(2, 10, 0)], true);
+    assert.equal(c.buttons.at(-1)[1], 2);
+    await c._sf25ApplyProperties(device, [prop(2, 1, 3)], true);
+    assert.equal(c.buttons.at(-1)[1], 3);
+    await c._sf25ApplyProperties(device, [prop(2, 10, 1)], true);
+    assert.equal(c.buttons.at(-1)[1], 3);
+  });
+  it('does not derive activity from failed, invalid or stale poll properties', async () => {
+    const c = harness();
+    await c._sf25ApplyProperties(device, [prop(2, 1, 2)], true);
+    const writes = c.buttons.length;
+    await c._sf25ApplyProperties(device, [prop(2, 1, 1)], false, Date.now() - 1000);
+    await c._sf25ApplyProperties(device, [prop(2, 1, 1, 1), prop(2, 10, '1')]);
+    assert.equal(c.buttons.length, writes);
+    assert.equal(c.buttons.at(-1)[1], 0);
   });
   it('writes numeric booleans once, checks readback and disables transport retries', async () => {
     const c = harness([reply([prop(6, 17, undefined)]), reply([prop(6, 17, 1)])]);
